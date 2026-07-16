@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsched"
+version = "0.1.0"
+description = "A tiny single-file GPU job scheduler (daemon + CLI)"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Richeek Das" }]
+keywords = ["gpu", "scheduler", "jobs", "queue", "cuda"]
+dependencies = ["rich>=13"]
+
+[project.urls]
+Homepage = "https://github.com/sudoRicheek/gsched"
+
+[project.scripts]
+gsched = "gsched:main"
+
+[tool.setuptools]
+py-modules = ["gsched"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
