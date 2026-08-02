@@ -25,8 +25,8 @@ def sched(tmp_path, monkeypatch):
     return gsched
 
 
-def _submit(g, cmd, name=None):
-    ns = types.SimpleNamespace(cmd=cmd, name=name)
+def _submit(g, cmd, name=None, notify=None, no_tty=True):
+    ns = types.SimpleNamespace(cmd=cmd, name=name, notify=notify, no_tty=no_tty)
     g.cmd_submit(ns)
 
 
@@ -59,7 +59,7 @@ def test_submit_creates_queued_row(sched):
 def test_submitf_reads_lines_and_tab_names(sched, tmp_path):
     f = tmp_path / "jobs.txt"
     f.write_text("# a comment\n\nplain-cmd\nnamed\techo hi\n")
-    sched.cmd_submitf(types.SimpleNamespace(file=str(f), name=None))
+    sched.cmd_submitf(types.SimpleNamespace(file=str(f), name=None, notify=None, no_tty=True))
     rows = _rows(sched.db())
     assert [r["cmd"] for r in rows] == ["plain-cmd", "echo hi"]
     assert rows[1]["name"] == "named"          # name<TAB>cmd parsed
@@ -219,6 +219,133 @@ def test_gpus_without_daemon_is_noop(sched):
     c = sched.db()
     sched.cmd_gpus(types.SimpleNamespace(gpus="0,1"))
     assert c.execute("SELECT * FROM daemon").fetchone() is None
+
+
+# ---------- notification ----------
+def _wait_hooks(g, timeout=5):
+    """Block until every fired notify hook has exited."""
+    end = time.time() + timeout
+    while time.time() < end and any(h.poll() is None for h in g._HOOKS):
+        time.sleep(0.02)
+
+
+def test_job_hook_fires_on_completion_with_env(sched, tmp_path):
+    c = sched.db()
+    out = tmp_path / "notified.txt"
+    _submit(sched, "true", name="run-a",
+            notify=f"echo \"$GSCHED_ID $GSCHED_NAME $GSCHED_STATUS $GSCHED_RC\" > {out}")
+    procs = {}
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_exit(procs)
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))   # reap -> done -> notify
+    _wait_hooks(sched)
+    assert out.read_text().split() == ["1", "run-a", "done", "0"]
+
+
+def test_hook_reports_failure_rc(sched, tmp_path):
+    c = sched.db()
+    out = tmp_path / "n.txt"
+    _submit(sched, "false", notify=f"echo $GSCHED_STATUS $GSCHED_RC > {out}")
+    procs = {}
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_exit(procs)
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_hooks(sched)
+    assert out.read_text().split() == ["failed", "1"]
+
+
+def test_daemon_wide_hook_applies_to_jobs_without_one(sched, tmp_path):
+    c = sched.db()
+    out = tmp_path / "d.txt"
+    c.execute("INSERT INTO daemon(id,pid,gpus,poll,mem,heartbeat,notify) "
+              "VALUES(1,1,'0',7,2000,0,?)", (f"echo $GSCHED_ID >> {out}",))
+    c.commit()
+    _submit(sched, "true")
+    procs = {}
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_exit(procs)
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_hooks(sched)
+    assert out.read_text().split() == ["1"]
+
+
+def test_job_hook_overrides_daemon_hook(sched, tmp_path):
+    c = sched.db()
+    dhook, jhook = tmp_path / "d.txt", tmp_path / "j.txt"
+    c.execute("INSERT INTO daemon(id,pid,gpus,poll,mem,heartbeat,notify) "
+              "VALUES(1,1,'0',7,2000,0,?)", (f"touch {dhook}",))
+    c.commit()
+    _submit(sched, "true", notify=f"touch {jhook}")
+    procs = {}
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_exit(procs)
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_hooks(sched)
+    assert jhook.exists() and not dhook.exists()
+
+
+def test_eviction_also_notifies(sched, tmp_path):
+    c = sched.db()
+    out = tmp_path / "e.txt"
+    _submit(sched, "sleep 60", notify=f"echo $GSCHED_STATUS > {out}")
+    procs = {}
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    sched.cmd_evict(types.SimpleNamespace(id=1))
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_hooks(sched)
+    assert out.read_text().strip() == "evicted"
+
+
+def test_submit_records_tty_and_writes_to_it(sched, tmp_path, monkeypatch):
+    """The submitting terminal is recorded, and the finish line is written to it.
+    A regular file stands in for the tty - _write_tty just opens and writes."""
+    c = sched.db()
+    fake_tty = tmp_path / "tty"
+    fake_tty.write_text("")
+    monkeypatch.setattr(sched, "cur_tty", lambda: str(fake_tty))
+    _submit(sched, "true", name="run-a", no_tty=False)
+    assert _rows(c)[0]["tty"] == str(fake_tty)
+    procs = {}
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    _wait_exit(procs)
+    sched._step(c, [0], procs, 2000, mem_fn=_free(0))
+    text = fake_tty.read_text()
+    assert "job 1" in text and "run-a" in text and "done" in text and "rc=0" in text
+
+
+def test_no_tty_records_nothing(sched, tmp_path, monkeypatch):
+    monkeypatch.setattr(sched, "cur_tty", lambda: str(tmp_path / "tty"))
+    _submit(sched, "true", no_tty=True)
+    assert _rows(sched.db())[0]["tty"] is None
+
+
+def test_dead_tty_and_broken_hook_do_not_break_scheduling(sched, tmp_path):
+    """A gone terminal / nonsense hook must not stop the daemon reaping jobs."""
+    c = sched.db()
+    c.execute("INSERT INTO jobs(cmd,status,gpu,pid,started,tty,notify) "
+              "VALUES('x','running',0,999999,0,?,'this-command-does-not-exist')",
+              (str(tmp_path / "gone-tty"),))
+    c.commit()
+    sched._step(c, [0], {}, 2000, mem_fn=_free(0))
+    assert _rows(c)[0]["status"] == "done"
+
+
+def test_notify_env_var_is_the_default_hook(sched, tmp_path, monkeypatch):
+    monkeypatch.setenv("GSCHED_NOTIFY", "touch /dev/null")
+    _submit(sched, "true", notify=None)
+    assert _rows(sched.db())[0]["notify"] == "touch /dev/null"
+
+
+def test_daemon_restart_keeps_the_hook(sched, tmp_path, monkeypatch):
+    c = sched.db()
+    c.execute("INSERT INTO daemon(id,pid,gpus,poll,mem,heartbeat,notify) "
+              "VALUES(1,1,'0',7,2000,0,'my-hook')")
+    c.commit()
+    # cmd_daemon re-registers then loops forever; stop it right after registration
+    monkeypatch.setattr(sched.time, "sleep", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        sched.cmd_daemon(types.SimpleNamespace(gpus="0", poll=7, mem=2000, notify=None))
+    assert c.execute("SELECT notify FROM daemon WHERE id=1").fetchone()["notify"] == "my-hook"
 
 
 # ---------- restart resilience ----------

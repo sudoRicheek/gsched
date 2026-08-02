@@ -20,10 +20,16 @@ picks the changes up on its next poll. rich renders the dashboard.
   python gsched.py evict 7                                # cancel/kill job 7
   python gsched.py logs 7                                 # tail job 7's log
   python gsched.py rm --done                              # forget finished rows
+
+When a job ends the daemon notifies you instead of you polling `status`: it
+writes a line back to the terminal that submitted the job (its tty is recorded
+at submit time) and runs a notify hook if one is set (`gsched notify "<cmd>"`
+machine-wide, `--notify` per job, or $GSCHED_NOTIFY in the submitting shell).
 """
 import argparse
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -47,13 +53,20 @@ CREATE TABLE IF NOT EXISTS jobs(
   log      TEXT,
   created  REAL,
   started  REAL,
-  finished REAL
+  finished REAL,
+  tty      TEXT,                             -- terminal that submitted it
+  host     TEXT,
+  notify   TEXT                              -- per-job hook, overrides daemon's
 );
 CREATE TABLE IF NOT EXISTS daemon(
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  pid INTEGER, gpus TEXT, poll REAL, mem INTEGER, heartbeat REAL
+  pid INTEGER, gpus TEXT, poll REAL, mem INTEGER, heartbeat REAL,
+  notify TEXT                                -- machine-wide hook
 );
 """
+# columns added after v1; older ~/.gsched/gsched.db files get them on open
+MIGRATIONS = [("jobs", "tty TEXT"), ("jobs", "host TEXT"), ("jobs", "notify TEXT"),
+              ("daemon", "notify TEXT")]
 
 
 # ---------- storage ----------
@@ -65,6 +78,10 @@ def db():
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA busy_timeout=15000")
     c.executescript(SCHEMA)
+    for table, col in MIGRATIONS:
+        if col.split()[0] not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+    c.commit()
     return c
 
 
@@ -94,10 +111,98 @@ def alive(pid):
         return False
 
 
+def _dur(a, b):
+    if not a:
+        return "-"
+    s = int((b or time.time()) - a)
+    h, m, s = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# ---------- notification (so nobody has to sit on `status`) ----------
+_HOOKS = []  # live hook processes, reaped each poll so they don't linger as zombies
+
+
+def cur_tty():
+    """Path of the terminal we were invoked from, or None (piped/cron/nohup)."""
+    for fd in (0, 1, 2):
+        try:
+            return os.ttyname(fd)
+        except OSError:
+            continue
+    return None
+
+
+def _msg(row):
+    name = f" '{row['name']}'" if row["name"] else ""
+    rc = "" if row["rc"] is None else f" rc={row['rc']}"
+    gpu = "" if row["gpu"] is None else f" on GPU{row['gpu']}"
+    return (f"[gsched] job {row['id']}{name} {row['status']}{rc}{gpu} "
+            f"after {_dur(row['started'], row['finished'])}  ({row['log'] or 'no log'})")
+
+
+def _write_tty(path, msg):
+    """Print one line on the submitting terminal. Non-blocking, best effort:
+    the session may be gone, or have `mesg n` set - either way, never raise."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, ("\a\r\n" + msg + "\r\n").encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _run_hook(cmd, row, msg):
+    """Fire the notify hook detached, with the job's fields in the environment.
+    Its output goes to ~/.gsched/notify.log so a broken hook is debuggable."""
+    env = {**os.environ,
+           "GSCHED_ID": str(row["id"]),
+           "GSCHED_NAME": row["name"] or "",
+           "GSCHED_STATUS": row["status"],
+           "GSCHED_RC": "" if row["rc"] is None else str(row["rc"]),
+           "GSCHED_GPU": "" if row["gpu"] is None else str(row["gpu"]),
+           "GSCHED_CMD": row["cmd"],
+           "GSCHED_LOG": row["log"] or "",
+           "GSCHED_HOST": row["host"] or socket.gethostname(),
+           "GSCHED_ELAPSED": _dur(row["started"], row["finished"]),
+           "GSCHED_MSG": msg}
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    try:
+        f = open(os.path.join(GDIR, "notify.log"), "a")
+        _HOOKS.append(subprocess.Popen(cmd, shell=True, env=env, stdout=f,
+                                       stderr=subprocess.STDOUT, preexec_fn=os.setsid))
+    except OSError as e:
+        print(f"notify hook failed for job {row['id']}: {e}", flush=True)
+
+
+def notify(c, row):
+    """Tell whoever submitted `row` that it ended: a line on their terminal plus
+    the hook (the job's own, else the machine-wide one). Never raises - a bad
+    notification must not take down the scheduler."""
+    try:
+        msg = _msg(row)
+        if row["tty"]:
+            _write_tty(row["tty"], msg)
+        d = c.execute("SELECT notify FROM daemon WHERE id=1").fetchone()
+        hook = row["notify"] or (d["notify"] if d else None)
+        if hook:
+            _run_hook(hook, row, msg)
+    except Exception as e:                      # noqa: BLE001 - deliberately total
+        print(f"notify failed for job {row['id']}: {e}", flush=True)
+
+
 # ---------- scheduling core (one poll iteration; unit-tested) ----------
 def _finish(c, jid, status, rc=None):
     c.execute("UPDATE jobs SET status=?, rc=?, finished=? WHERE id=?",
               (status, rc, time.time(), jid))
+    row = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    if row:
+        notify(c, row)
 
 
 def _launch(c, row, gpu):
@@ -118,6 +223,8 @@ def _step(c, gpus, procs, mem_thresh, mem_fn=gpu_mem):
     launch queued jobs onto free allowed GPUs. `procs` maps job_id->Popen for
     this session; `mem_fn` returns {gpu: used_MiB} (injectable for tests).
     Returns the number of jobs launched this step."""
+    # 0. reap exited notify hooks so they don't pile up as zombies
+    _HOOKS[:] = [h for h in _HOOKS if h.poll() is None]
     # 1. reap jobs we launched this session (exact return code)
     for jid, p in list(procs.items()):
         rc = p.poll()
@@ -161,12 +268,15 @@ def _step(c, gpus, procs, mem_thresh, mem_fn=gpu_mem):
 # ---------- the daemon (loop over _step) ----------
 def cmd_daemon(a):
     c = db()
-    c.execute("INSERT OR REPLACE INTO daemon(id,pid,gpus,poll,mem,heartbeat) VALUES(1,?,?,?,?,?)",
-              (os.getpid(), a.gpus, a.poll, a.mem, time.time()))
+    old = c.execute("SELECT notify FROM daemon WHERE id=1").fetchone()
+    hook = a.notify or (old["notify"] if old else None)   # a restart keeps the hook
+    c.execute("INSERT OR REPLACE INTO daemon(id,pid,gpus,poll,mem,heartbeat,notify) "
+              "VALUES(1,?,?,?,?,?,?)",
+              (os.getpid(), a.gpus, a.poll, a.mem, time.time(), hook))
     c.commit()
     procs = {}  # job_id -> Popen
-    print(f"gsched daemon pid={os.getpid()} gpus={a.gpus} poll={a.poll}s mem_free<{a.mem}MiB",
-          flush=True)
+    print(f"gsched daemon pid={os.getpid()} gpus={a.gpus} poll={a.poll}s mem_free<{a.mem}MiB"
+          + (f" notify={hook}" if hook else ""), flush=True)
     while True:
         # re-read config each loop so `gsched gpus ...` / `mem ...` apply live
         d = c.execute("SELECT gpus,mem,poll FROM daemon WHERE id=1").fetchone()
@@ -188,17 +298,71 @@ def cmd_gpus(a):
     print(f"allowed GPUs -> {a.gpus} (daemon applies it on the next poll)")
 
 
+def cmd_notify(a):
+    """Get/set/clear the machine-wide hook, or test where a notification lands."""
+    c = db()
+    if a.test or a.test_id:
+        row = (c.execute("SELECT * FROM jobs WHERE id=?", (a.test_id,)).fetchone() if a.test_id
+               else None)
+        if a.test_id and not row:
+            print(f"no job {a.test_id}")
+            return
+        if row is None:   # synthesise a job-shaped row aimed at this terminal
+            c.execute(INSERT, ("notify-test", "true", time.time(), cur_tty(),
+                               socket.gethostname(), a.cmd or os.environ.get("GSCHED_NOTIFY")))
+            jid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            c.execute("UPDATE jobs SET status='done', rc=0, started=?, finished=? WHERE id=?",
+                      (time.time(), time.time(), jid))
+            c.commit()
+            row = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+            notify(c, row)
+            c.execute("DELETE FROM jobs WHERE id=?", (jid,))
+            c.commit()
+        else:
+            notify(c, row)
+        for h in _HOOKS:
+            h.wait()
+        print(f"sent: {_msg(row)}\ntty={row['tty'] or 'none (not a terminal)'}  "
+              f"hook output -> {os.path.join(GDIR, 'notify.log')}")
+        return
+    if not c.execute("SELECT 1 FROM daemon WHERE id=1").fetchone():
+        print("no daemon registered yet - start it first")
+        return
+    if a.clear:
+        c.execute("UPDATE daemon SET notify=NULL WHERE id=1")
+        c.commit()
+        print("machine-wide notify hook cleared")
+    elif a.cmd:
+        c.execute("UPDATE daemon SET notify=? WHERE id=1", (a.cmd,))
+        c.commit()
+        print(f"machine-wide notify hook -> {a.cmd}")
+    else:
+        d = c.execute("SELECT notify FROM daemon WHERE id=1").fetchone()
+        print(d["notify"] or "no machine-wide notify hook set")
+
+
 # ---------- CLI verbs ----------
+INSERT = ("INSERT INTO jobs(name,cmd,status,created,tty,host,notify) "
+          "VALUES(?,?,'queued',?,?,?,?)")
+
+
+def _where(a):
+    """(tty, host, hook) to notify when a job submitted right now finishes."""
+    tty = None if getattr(a, "no_tty", False) else cur_tty()
+    return tty, socket.gethostname(), getattr(a, "notify", None) or os.environ.get("GSCHED_NOTIFY")
+
+
 def cmd_submit(a):
     c = db()
-    cur = c.execute("INSERT INTO jobs(name,cmd,status,created) VALUES(?,?,'queued',?)",
-                    (a.name, a.cmd, time.time()))
+    tty, host, hook = _where(a)
+    cur = c.execute(INSERT, (a.name, a.cmd, time.time(), tty, host, hook))
     c.commit()
-    print(f"queued job {cur.lastrowid}")
+    print(f"queued job {cur.lastrowid}" + (f" (will notify {tty})" if tty else ""))
 
 
 def cmd_submitf(a):
     c = db()
+    tty, host, hook = _where(a)
     n = 0
     for line in open(a.file):
         line = line.strip()
@@ -208,11 +372,10 @@ def cmd_submitf(a):
         # allow "name<TAB>command" lines for readable batches
         if "\t" in line:
             name, line = line.split("\t", 1)
-        c.execute("INSERT INTO jobs(name,cmd,status,created) VALUES(?,?,'queued',?)",
-                  (name, line.strip(), time.time()))
+        c.execute(INSERT, (name, line.strip(), time.time(), tty, host, hook))
         n += 1
     c.commit()
-    print(f"queued {n} jobs from {a.file}")
+    print(f"queued {n} jobs from {a.file}" + (f" (will notify {tty})" if tty else ""))
 
 
 def cmd_evict(a):
@@ -253,14 +416,6 @@ def cmd_logs(a):
     subprocess.run(["tail", "-n", str(a.n), row["log"]])
 
 
-def _dur(a, b):
-    if not a:
-        return "-"
-    s = int((b or time.time()) - a)
-    h, m, s = s // 3600, (s % 3600) // 60, s % 60
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
 def cmd_status(a):
     from rich.console import Console
     from rich.table import Table
@@ -274,7 +429,8 @@ def cmd_status(a):
         age = time.time() - d["heartbeat"]
         state = "[bold green]● alive[/]" if age < d["poll"] * 3 else f"[bold red]● stale {int(age)}s[/]"
         con.print(f"{state}  daemon pid [cyan]{d['pid']}[/]  gpus [cyan]{d['gpus']}[/]  "
-                  f"poll {d['poll']:g}s  mem_free<{d['mem']}MiB")
+                  f"poll {d['poll']:g}s  mem_free<{d['mem']}MiB"
+                  + (f"  notify [cyan]{d['notify']}[/]" if d["notify"] else ""))
     else:
         con.print("[bold red]no daemon registered[/] - start:  python gsched.py daemon --gpus 0,1,2,3")
 
@@ -340,21 +496,37 @@ def main():
     d.add_argument("--gpus", required=True, help="comma list, e.g. 0,1,2,3")
     d.add_argument("--poll", type=float, default=POLL_S)
     d.add_argument("--mem", type=int, default=MEM_FREE_MB, help="free-GPU memory threshold MiB")
+    d.add_argument("--notify", default=None, help="machine-wide hook run when any job ends")
     d.set_defaults(fn=cmd_daemon)
+
+    def _notify_flags(p_):
+        p_.add_argument("--notify", default=None,
+                        help="shell hook to run when this job ends (default $GSCHED_NOTIFY)")
+        p_.add_argument("--no-tty", action="store_true",
+                        help="don't write the result back to this terminal")
 
     s = sub.add_parser("submit", help="queue one command")
     s.add_argument("cmd")
     s.add_argument("--name", default=None)
+    _notify_flags(s)
     s.set_defaults(fn=cmd_submit)
 
     sf = sub.add_parser("submitf", help="queue every line of a file (optional name<TAB>cmd)")
     sf.add_argument("file")
     sf.add_argument("--name", default=None)
+    _notify_flags(sf)
     sf.set_defaults(fn=cmd_submitf)
 
-    g = sub.add_parser("gpus", help="change the daemon's allowed GPU list live")
+    g = sub.add_parser("gpus", help="change the allowed GPU list live")
     g.add_argument("gpus", help="comma list, e.g. 0,1,2,3,4,5")
     g.set_defaults(fn=cmd_gpus)
+
+    n = sub.add_parser("notify", help="show/set/clear the machine-wide notify hook")
+    n.add_argument("cmd", nargs="?", default=None, help="shell command; omit to show current")
+    n.add_argument("--clear", action="store_true")
+    n.add_argument("--test", action="store_true", help="fire a notification right now")
+    n.add_argument("--test-id", type=int, default=None, help="re-send job <id>'s notification")
+    n.set_defaults(fn=cmd_notify)
 
     e = sub.add_parser("evict", help="cancel a queued job or kill a running one")
     e.add_argument("id", type=int)
