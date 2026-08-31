@@ -25,9 +25,14 @@ def sched(tmp_path, monkeypatch):
     return gsched
 
 
-def _submit(g, cmd, name=None, notify=None, no_tty=True):
-    ns = types.SimpleNamespace(cmd=cmd, name=name, notify=notify, no_tty=no_tty)
+def _submit(g, cmd, name=None, notify=None, no_tty=True, ngpu=1):
+    ns = types.SimpleNamespace(cmd=cmd, name=name, notify=notify, no_tty=no_tty, ngpu=ngpu)
     g.cmd_submit(ns)
+
+
+def _gpus_of(row):
+    """Physical GPUs a row was given, as a sorted list."""
+    return sorted(gsched.gpulist(row["gpus"]))
 
 
 def _rows(c, status=None):
@@ -53,13 +58,14 @@ def test_submit_creates_queued_row(sched):
     _submit(sched, "true", name="job-a")
     (r,) = _rows(c)
     assert r["status"] == "queued" and r["cmd"] == "true" and r["name"] == "job-a"
-    assert r["gpu"] is None and r["pid"] is None
+    assert r["gpus"] is None and r["pid"] is None and r["ngpu"] == 1
 
 
 def test_submitf_reads_lines_and_tab_names(sched, tmp_path):
     f = tmp_path / "jobs.txt"
     f.write_text("# a comment\n\nplain-cmd\nnamed\techo hi\n")
-    sched.cmd_submitf(types.SimpleNamespace(file=str(f), name=None, notify=None, no_tty=True))
+    sched.cmd_submitf(types.SimpleNamespace(file=str(f), name=None, notify=None,
+                                            no_tty=True, ngpu=1))
     rows = _rows(sched.db())
     assert [r["cmd"] for r in rows] == ["plain-cmd", "echo hi"]
     assert rows[1]["name"] == "named"          # name<TAB>cmd parsed
@@ -92,7 +98,7 @@ def test_dispatch_fills_free_gpus_fifo(sched):
     assert n == 3                                       # 3 jobs, 4 free gpus
     run = _rows(c, "running")
     assert [r["id"] for r in run] == [1, 2, 3]          # FIFO by id
-    assert sorted(r["gpu"] for r in run) == [0, 1, 2]   # distinct, lowest gpus
+    assert sorted(g for r in run for g in _gpus_of(r)) == [0, 1, 2]   # distinct, lowest
     for p in procs.values():
         p.terminate()
 
@@ -106,7 +112,7 @@ def test_dispatch_skips_busy_and_respects_allowed(sched):
     n = sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(2))
     assert n == 1
     (r,) = _rows(c, "running")
-    assert r["gpu"] == 2
+    assert _gpus_of(r) == [2]
     assert len(_rows(c, "queued")) == 3
     for p in procs.values():
         p.terminate()
@@ -163,7 +169,7 @@ def test_finished_gpu_is_reused_for_next_queued(sched):
     sched._step(c, [0], procs, 2000, mem_fn=_free(0))   # reap job1, launch job2
     assert _rows(c)[0]["status"] == "done"
     r2 = _rows(c)[1]
-    assert r2["status"] == "running" and r2["gpu"] == 0
+    assert r2["status"] == "running" and _gpus_of(r2) == [0]
     for p in procs.values():
         p.terminate()
 
@@ -219,6 +225,187 @@ def test_gpus_without_daemon_is_noop(sched):
     c = sched.db()
     sched.cmd_gpus(types.SimpleNamespace(gpus="0,1"))
     assert c.execute("SELECT * FROM daemon").fetchone() is None
+
+
+# ---------- multi-GPU jobs ----------
+def test_multi_gpu_job_gets_all_its_gpus_at_once(sched):
+    c = sched.db()
+    _submit(sched, "sleep 30", name="ddp", ngpu=4)
+    procs = {}
+    n = sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(0, 1, 2, 3))
+    assert n == 1
+    (r,) = _rows(c, "running")
+    assert _gpus_of(r) == [0, 1, 2, 3] and r["ngpu"] == 4
+    for p in procs.values():
+        p.terminate()
+
+
+def test_job_sees_exactly_its_gpus_in_cuda_visible_devices(sched, tmp_path):
+    c = sched.db()
+    out = tmp_path / "cvd.txt"
+    _submit(sched, f"echo $CUDA_VISIBLE_DEVICES > {out}", ngpu=2)
+    procs = {}
+    # gpus 1 and 3 are the free ones -> the job must be pinned to those two
+    sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(1, 3))
+    _wait_exit(procs)
+    assert out.read_text().strip() == "1,3"
+
+
+def test_multi_gpu_job_waits_until_enough_are_free(sched):
+    c = sched.db()
+    _submit(sched, "sleep 30", ngpu=3)
+    procs = {}
+    assert sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(0, 1)) == 0   # only 2 free
+    assert len(_rows(c, "queued")) == 1
+    assert sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(0, 1, 2)) == 1
+    assert _gpus_of(_rows(c, "running")[0]) == [0, 1, 2]
+    for p in procs.values():
+        p.terminate()
+
+
+def test_big_job_holds_the_queue_by_default(sched):
+    """Strict FIFO: a 4-GPU job at the head is not overtaken, so it can't starve."""
+    c = sched.db()
+    _submit(sched, "sleep 30", name="big", ngpu=4)
+    _submit(sched, "sleep 30", name="small")
+    procs = {}
+    n = sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(0, 1))   # 2 of 4 free
+    assert n == 0 and len(_rows(c, "queued")) == 2
+
+
+def test_backfill_lets_small_jobs_past_a_blocked_big_one(sched):
+    c = sched.db()
+    _submit(sched, "sleep 30", name="big", ngpu=4)
+    _submit(sched, "sleep 30", name="small")
+    procs = {}
+    n = sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(0, 1), backfill=True)
+    assert n == 1
+    (r,) = _rows(c, "running")
+    assert r["name"] == "small" and len(_gpus_of(r)) == 1
+    assert [x["name"] for x in _rows(c, "queued")] == ["big"]
+    for p in procs.values():
+        p.terminate()
+
+
+def test_impossible_request_is_skipped_not_queue_blocking(sched):
+    """8 GPUs on a 2-GPU daemon can never run - it must not stall everyone else."""
+    c = sched.db()
+    _submit(sched, "sleep 30", name="impossible", ngpu=8)
+    _submit(sched, "sleep 30", name="fine")
+    procs = {}
+    n = sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    assert n == 1
+    assert _rows(c, "running")[0]["name"] == "fine"
+    assert [r["name"] for r in _rows(c, "queued")] == ["impossible"]
+    for p in procs.values():
+        p.terminate()
+
+
+def test_gpus_of_a_multi_gpu_job_are_all_released_on_finish(sched):
+    c = sched.db()
+    _submit(sched, "true", ngpu=2)          # takes 0,1 then exits
+    _submit(sched, "sleep 30", ngpu=2)      # must be able to take them back
+    procs = {}
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    _wait_exit(procs)
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    assert _rows(c)[0]["status"] == "done"
+    assert _gpus_of(_rows(c)[1]) == [0, 1]
+    for p in procs.values():
+        p.terminate()
+
+
+def test_running_multi_gpu_job_blocks_every_gpu_it_holds(sched):
+    c = sched.db()
+    _submit(sched, "sleep 30", ngpu=2)
+    _submit(sched, "sleep 30")
+    procs = {}
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))   # job1 takes both
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))   # nothing left for job2
+    assert len(_rows(c, "running")) == 1 and len(_rows(c, "queued")) == 1
+    for p in procs.values():
+        p.terminate()
+
+
+def test_mixed_sizes_pack_onto_the_free_set(sched):
+    c = sched.db()
+    _submit(sched, "sleep 30", name="a", ngpu=2)
+    _submit(sched, "sleep 30", name="b")
+    _submit(sched, "sleep 30", name="c")
+    procs = {}
+    n = sched._step(c, [0, 1, 2, 3], procs, 2000, mem_fn=_free(0, 1, 2, 3))
+    assert n == 3
+    got = {r["name"]: _gpus_of(r) for r in _rows(c, "running")}
+    assert got == {"a": [0, 1], "b": [2], "c": [3]}
+    for p in procs.values():
+        p.terminate()
+
+
+def test_submitf_accepts_a_per_line_gpu_count(sched, tmp_path):
+    f = tmp_path / "jobs.txt"
+    f.write_text("solo\techo one\nddp\t4\ttorchrun train.py\nbare-cmd\n")
+    sched.cmd_submitf(types.SimpleNamespace(file=str(f), name=None, notify=None,
+                                            no_tty=True, ngpu=2))
+    rows = _rows(sched.db())
+    assert [(r["name"], r["ngpu"], r["cmd"]) for r in rows] == [
+        ("solo", 2, "echo one"),               # no count on the line -> file default
+        ("ddp", 4, "torchrun train.py"),       # name<TAB>ngpu<TAB>cmd
+        (None, 2, "bare-cmd")]
+
+
+def test_evicting_multi_gpu_job_frees_all_of_its_gpus(sched):
+    c = sched.db()
+    _submit(sched, "sleep 60", ngpu=2)
+    _submit(sched, "sleep 60", ngpu=2)
+    procs = {}
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    sched.cmd_evict(types.SimpleNamespace(id=1))
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    statuses = {r["id"]: r["status"] for r in _rows(c)}
+    assert statuses[1] == "evicted" and statuses[2] == "running"
+    assert _gpus_of(_rows(c)[1]) == [0, 1]
+    for p in procs.values():
+        p.terminate()
+
+
+def test_multi_gpu_notification_names_every_gpu(sched, tmp_path):
+    c = sched.db()
+    out = tmp_path / "n.txt"
+    _submit(sched, "true", name="ddp", ngpu=2,
+            notify=f"echo \"$GSCHED_GPUS|$GSCHED_GPU|$GSCHED_NGPU\" > {out}")
+    procs = {}
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    _wait_exit(procs)
+    sched._step(c, [0, 1], procs, 2000, mem_fn=_free(0, 1))
+    _wait_hooks(sched)
+    assert out.read_text().strip() == "0,1|0|2"
+    assert "on GPUs 0,1" in sched._msg(_rows(c)[0])
+
+
+def test_old_db_rows_migrate_to_the_gpu_list(sched, tmp_path):
+    """A v2 DB (one gpu per job, no ngpu) opens and keeps its history readable."""
+    import sqlite3
+    path = str(tmp_path / "gsched.db")
+    old = sqlite3.connect(path)
+    old.executescript("""CREATE TABLE jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT,
+      cmd TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', gpu INTEGER, pid INTEGER,
+      rc INTEGER, log TEXT, created REAL, started REAL, finished REAL);
+      CREATE TABLE daemon(id INTEGER PRIMARY KEY CHECK (id=1), pid INTEGER, gpus TEXT,
+      poll REAL, mem INTEGER, heartbeat REAL);
+      INSERT INTO jobs(name,cmd,status,gpu,rc) VALUES('old','true','done',3,0);
+      INSERT INTO jobs(name,cmd,status) VALUES('waiting','true','queued');""")
+    old.commit()
+    old.close()
+    c = sched.db()                       # migrates in place
+    rows = _rows(c)
+    assert _gpus_of(rows[0]) == [3]      # v2 gpu -> v3 gpus list
+    assert rows[0]["ngpu"] == 1 and rows[1]["ngpu"] == 1
+    _submit(sched, "sleep 30", ngpu=2)   # and the migrated DB schedules normally
+    procs = {}                           # the legacy queued row takes gpu0, ours takes 1,2
+    assert sched._step(c, [0, 1, 2], procs, 2000, mem_fn=_free(0, 1, 2)) == 2
+    assert _gpus_of(_rows(c)[2]) == [1, 2]
+    for p in procs.values():
+        p.terminate()
 
 
 # ---------- notification ----------
@@ -322,8 +509,8 @@ def test_no_tty_records_nothing(sched, tmp_path, monkeypatch):
 def test_dead_tty_and_broken_hook_do_not_break_scheduling(sched, tmp_path):
     """A gone terminal / nonsense hook must not stop the daemon reaping jobs."""
     c = sched.db()
-    c.execute("INSERT INTO jobs(cmd,status,gpu,pid,started,tty,notify) "
-              "VALUES('x','running',0,999999,0,?,'this-command-does-not-exist')",
+    c.execute("INSERT INTO jobs(cmd,status,gpus,pid,started,tty,notify) "
+              "VALUES('x','running','0',999999,0,?,'this-command-does-not-exist')",
               (str(tmp_path / "gone-tty"),))
     c.commit()
     sched._step(c, [0], {}, 2000, mem_fn=_free(0))
@@ -344,8 +531,22 @@ def test_daemon_restart_keeps_the_hook(sched, tmp_path, monkeypatch):
     # cmd_daemon re-registers then loops forever; stop it right after registration
     monkeypatch.setattr(sched.time, "sleep", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     with pytest.raises(KeyboardInterrupt):
-        sched.cmd_daemon(types.SimpleNamespace(gpus="0", poll=7, mem=2000, notify=None))
+        sched.cmd_daemon(types.SimpleNamespace(gpus="0", poll=7, mem=2000, notify=None,
+                                               backfill=False, no_backfill=False))
     assert c.execute("SELECT notify FROM daemon WHERE id=1").fetchone()["notify"] == "my-hook"
+
+
+def test_backfill_survives_a_restart_and_can_be_turned_off(sched, monkeypatch):
+    c = sched.db()
+    stop = lambda *_: (_ for _ in ()).throw(KeyboardInterrupt)   # noqa: E731
+    monkeypatch.setattr(sched.time, "sleep", stop)
+    ns = dict(gpus="0", poll=7, mem=2000, notify=None)
+    for kw, want in ((dict(backfill=True, no_backfill=False), 1),      # set it
+                     (dict(backfill=False, no_backfill=False), 1),     # restart remembers
+                     (dict(backfill=False, no_backfill=True), 0)):     # explicit off
+        with pytest.raises(KeyboardInterrupt):
+            sched.cmd_daemon(types.SimpleNamespace(**ns, **kw))
+        assert c.execute("SELECT backfill FROM daemon WHERE id=1").fetchone()[0] == want
 
 
 # ---------- restart resilience ----------
@@ -353,7 +554,7 @@ def test_reaps_orphaned_running_row_after_restart(sched):
     # simulate a running row whose process is already dead and NOT in our procs
     # (as if the daemon restarted): _step should mark it done.
     c = sched.db()
-    c.execute("INSERT INTO jobs(cmd,status,gpu,pid,started) VALUES('x','running',0,999999,0)")
+    c.execute("INSERT INTO jobs(cmd,status,gpus,pid,started) VALUES('x','running','0',999999,0)")
     c.commit()
     sched._step(c, [0], {}, 2000, mem_fn=_free(0))
     assert _rows(c)[0]["status"] == "done"

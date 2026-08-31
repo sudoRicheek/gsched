@@ -3,8 +3,11 @@
 
 One daemon per machine owns a list of GPUs. Every few seconds it checks which
 of those GPUs are free (low used-memory AND not already running one of our jobs)
-and launches the next queued job on each free GPU. That's the whole scheduling
-logic - a poll loop over a FIFO queue.
+and walks the queue in order, handing each job the number of GPUs it asked for
+(--ngpu, default 1) until it runs out. That's the whole scheduling logic - a poll
+loop over a FIFO queue. A job that needs more GPUs than are free holds the queue
+until they open up, so big jobs can't starve (daemon --backfill lets smaller jobs
+past it instead).
 
 Coordination is a single SQLite file (~/.gsched/gsched.db): the daemon and the
 CLI both just read/write it, so there are no sockets or servers. Submitting a
@@ -15,6 +18,7 @@ picks the changes up on its next poll. rich renders the dashboard.
   python gsched.py daemon --gpus 0,1,2,3
   # then from anywhere on that box (same $HOME):
   python gsched.py submit "python train.py ..."  --name run-a
+  python gsched.py submit "torchrun --nproc-per-node 4 t.py" --ngpu 4   # multi-GPU
   python gsched.py submitf jobs.txt                       # queue every line
   python gsched.py status                                 # dashboard
   python gsched.py evict 7                                # cancel/kill job 7
@@ -47,7 +51,8 @@ CREATE TABLE IF NOT EXISTS jobs(
   name     TEXT,
   cmd      TEXT NOT NULL,
   status   TEXT NOT NULL DEFAULT 'queued',   -- queued running done failed evicted
-  gpu      INTEGER,
+  ngpu     INTEGER NOT NULL DEFAULT 1,       -- how many GPUs it asked for
+  gpus     TEXT,                             -- which it got, e.g. "0,3"
   pid      INTEGER,
   rc       INTEGER,
   log      TEXT,
@@ -61,12 +66,18 @@ CREATE TABLE IF NOT EXISTS jobs(
 CREATE TABLE IF NOT EXISTS daemon(
   id INTEGER PRIMARY KEY CHECK (id = 1),
   pid INTEGER, gpus TEXT, poll REAL, mem INTEGER, heartbeat REAL,
-  notify TEXT                                -- machine-wide hook
+  notify TEXT,                               -- machine-wide hook
+  backfill INTEGER DEFAULT 0                 -- let small jobs pass a blocked big one
 );
 """
-# columns added after v1; older ~/.gsched/gsched.db files get them on open
-MIGRATIONS = [("jobs", "tty TEXT"), ("jobs", "host TEXT"), ("jobs", "notify TEXT"),
-              ("daemon", "notify TEXT")]
+# (table, column, backfill SQL) for columns added after v1; older
+# ~/.gsched/gsched.db files get them - and their old rows fixed up - on open.
+# v2 stored one GPU per job in jobs.gpu; v3 stores the list it was given.
+MIGRATIONS = [("jobs", "tty TEXT", None), ("jobs", "host TEXT", None),
+              ("jobs", "notify TEXT", None), ("daemon", "notify TEXT", None),
+              ("jobs", "ngpu INTEGER NOT NULL DEFAULT 1", None),
+              ("jobs", "gpus TEXT", "UPDATE jobs SET gpus=CAST(gpu AS TEXT) WHERE gpu IS NOT NULL"),
+              ("daemon", "backfill INTEGER DEFAULT 0", None)]
 
 
 # ---------- storage ----------
@@ -78,9 +89,12 @@ def db():
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA busy_timeout=15000")
     c.executescript(SCHEMA)
-    for table, col in MIGRATIONS:
-        if col.split()[0] not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+    for table, col, fixup in MIGRATIONS:
+        cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if col.split()[0] not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+            if fixup:
+                c.execute(fixup)
     c.commit()
     return c
 
@@ -99,6 +113,16 @@ def gpu_mem():
         idx, mem = line.split(",")
         out[int(idx)] = int(mem)
     return out
+
+
+def gpulist(s):
+    """'0,3' -> [0, 3]; None/'' -> []. The one place GPU lists get parsed."""
+    return [int(g) for g in str(s).split(",") if g.strip()] if s else []
+
+
+def fmt(gpus):
+    """[0, 3] -> '0,3'."""
+    return ",".join(str(g) for g in gpus)
 
 
 def alive(pid):
@@ -136,7 +160,8 @@ def cur_tty():
 def _msg(row):
     name = f" '{row['name']}'" if row["name"] else ""
     rc = "" if row["rc"] is None else f" rc={row['rc']}"
-    gpu = "" if row["gpu"] is None else f" on GPU{row['gpu']}"
+    g = gpulist(row["gpus"])
+    gpu = "" if not g else (f" on GPU{g[0]}" if len(g) == 1 else f" on GPUs {fmt(g)}")
     return (f"[gsched] job {row['id']}{name} {row['status']}{rc}{gpu} "
             f"after {_dur(row['started'], row['finished'])}  ({row['log'] or 'no log'})")
 
@@ -165,7 +190,9 @@ def _run_hook(cmd, row, msg):
            "GSCHED_NAME": row["name"] or "",
            "GSCHED_STATUS": row["status"],
            "GSCHED_RC": "" if row["rc"] is None else str(row["rc"]),
-           "GSCHED_GPU": "" if row["gpu"] is None else str(row["gpu"]),
+           "GSCHED_GPUS": row["gpus"] or "",          # all of them, "0,3"
+           "GSCHED_GPU": str(gpulist(row["gpus"])[0]) if row["gpus"] else "",   # the first
+           "GSCHED_NGPU": str(row["ngpu"] or 1),
            "GSCHED_CMD": row["cmd"],
            "GSCHED_LOG": row["log"] or "",
            "GSCHED_HOST": row["host"] or socket.gethostname(),
@@ -205,20 +232,30 @@ def _finish(c, jid, status, rc=None):
         notify(c, row)
 
 
-def _launch(c, row, gpu):
-    """Start one queued row on `gpu`, mark it running, return its Popen."""
+def _launch(c, row, gpus):
+    """Start one queued row on `gpus` (a list), mark it running, return its Popen.
+    The job sees exactly those devices, renumbered from 0 - so a 4-GPU job asks
+    torch for cuda:0..3 no matter which four physical GPUs it was handed."""
     log = os.path.join(LOGDIR, f"job{row['id']}.log")
     os.makedirs(LOGDIR, exist_ok=True)
     f = open(log, "a")
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)}
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": fmt(gpus)}
     p = subprocess.Popen(row["cmd"], shell=True, env=env,
                          stdout=f, stderr=subprocess.STDOUT, preexec_fn=os.setsid)
-    c.execute("UPDATE jobs SET status='running', gpu=?, pid=?, started=?, log=? WHERE id=?",
-              (gpu, p.pid, time.time(), log, row["id"]))
+    c.execute("UPDATE jobs SET status='running', gpus=?, pid=?, started=?, log=? WHERE id=?",
+              (fmt(gpus), p.pid, time.time(), log, row["id"]))
     return p
 
 
-def _step(c, gpus, procs, mem_thresh, mem_fn=gpu_mem):
+def _free_gpus(c, gpus, mem, mem_thresh):
+    """Allowed GPUs that no job of ours holds and that nvidia-smi says are idle."""
+    held = set()
+    for r in c.execute("SELECT gpus FROM jobs WHERE status IN ('running','evicting')"):
+        held |= set(gpulist(r["gpus"]))
+    return [g for g in gpus if g not in held and mem.get(g, 10**9) < mem_thresh]
+
+
+def _step(c, gpus, procs, mem_thresh, mem_fn=gpu_mem, backfill=False):
     """One scheduling iteration: reap finished jobs, carry out evictions, and
     launch queued jobs onto free allowed GPUs. `procs` maps job_id->Popen for
     this session; `mem_fn` returns {gpu: used_MiB} (injectable for tests).
@@ -245,22 +282,25 @@ def _step(c, gpus, procs, mem_thresh, mem_fn=gpu_mem):
         procs.pop(row["id"], None)  # else the next reap re-marks it 'failed'
         _finish(c, row["id"], "evicted")
     c.commit()
-    # 4. dispatch: one queued job onto each free allowed GPU
-    mem = mem_fn()
-    busy = {r["gpu"] for r in c.execute("SELECT gpu FROM jobs WHERE status='running'")}
+    # 4. dispatch: walk the queue in order, giving each job the GPUs it asked for
+    free = _free_gpus(c, gpus, mem_fn(), mem_thresh)
     launched = 0
-    for g in gpus:
-        if g in busy or mem.get(g, 10**9) >= mem_thresh:
-            continue
-        row = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
-        if not row:
+    for row in c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id").fetchall():
+        if not free:
             break
-        procs[row["id"]] = _launch(c, row, g)
-        busy.add(g)
+        n = row["ngpu"] or 1
+        if n > len(gpus):
+            continue        # more than this daemon will ever have; don't block the queue
+        if n > len(free):
+            if backfill:
+                continue    # let a smaller job through (may delay this one indefinitely)
+            break           # strict FIFO: keep the free GPUs for this job
+        take, free = free[:n], free[n:]
+        procs[row["id"]] = _launch(c, row, take)
         launched += 1
         c.commit()
-        print(f"launched job {row['id']} ({row['name'] or ''}) on GPU{g} "
-              f"pid={procs[row['id']].pid}", flush=True)
+        print(f"launched job {row['id']} ({row['name'] or ''}) on "
+              f"GPU{'s' if n > 1 else ''} {fmt(take)} pid={procs[row['id']].pid}", flush=True)
     c.commit()
     return launched
 
@@ -268,20 +308,20 @@ def _step(c, gpus, procs, mem_thresh, mem_fn=gpu_mem):
 # ---------- the daemon (loop over _step) ----------
 def cmd_daemon(a):
     c = db()
-    old = c.execute("SELECT notify FROM daemon WHERE id=1").fetchone()
+    old = c.execute("SELECT notify,backfill FROM daemon WHERE id=1").fetchone()
     hook = a.notify or (old["notify"] if old else None)   # a restart keeps the hook
-    c.execute("INSERT OR REPLACE INTO daemon(id,pid,gpus,poll,mem,heartbeat,notify) "
-              "VALUES(1,?,?,?,?,?,?)",
-              (os.getpid(), a.gpus, a.poll, a.mem, time.time(), hook))
+    bf = 0 if a.no_backfill else int(a.backfill or (old["backfill"] if old else 0))
+    c.execute("INSERT OR REPLACE INTO daemon(id,pid,gpus,poll,mem,heartbeat,notify,backfill) "
+              "VALUES(1,?,?,?,?,?,?,?)",
+              (os.getpid(), a.gpus, a.poll, a.mem, time.time(), hook, bf))
     c.commit()
     procs = {}  # job_id -> Popen
     print(f"gsched daemon pid={os.getpid()} gpus={a.gpus} poll={a.poll}s mem_free<{a.mem}MiB"
-          + (f" notify={hook}" if hook else ""), flush=True)
+          + (" backfill" if bf else "") + (f" notify={hook}" if hook else ""), flush=True)
     while True:
         # re-read config each loop so `gsched gpus ...` / `mem ...` apply live
-        d = c.execute("SELECT gpus,mem,poll FROM daemon WHERE id=1").fetchone()
-        gpus = [int(g) for g in d["gpus"].split(",")]
-        _step(c, gpus, procs, d["mem"])
+        d = c.execute("SELECT gpus,mem,poll,backfill FROM daemon WHERE id=1").fetchone()
+        _step(c, gpulist(d["gpus"]), procs, d["mem"], backfill=bool(d["backfill"]))
         c.execute("UPDATE daemon SET heartbeat=?, pid=? WHERE id=1", (time.time(), os.getpid()))
         c.commit()
         time.sleep(d["poll"])
@@ -309,7 +349,8 @@ def cmd_notify(a):
             return
         if row is None:   # synthesise a job-shaped row aimed at this terminal
             c.execute(INSERT, ("notify-test", "true", time.time(), cur_tty(),
-                               socket.gethostname(), a.cmd or os.environ.get("GSCHED_NOTIFY")))
+                               socket.gethostname(),
+                               a.cmd or os.environ.get("GSCHED_NOTIFY"), 1))
             jid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
             c.execute("UPDATE jobs SET status='done', rc=0, started=?, finished=? WHERE id=?",
                       (time.time(), time.time(), jid))
@@ -342,8 +383,8 @@ def cmd_notify(a):
 
 
 # ---------- CLI verbs ----------
-INSERT = ("INSERT INTO jobs(name,cmd,status,created,tty,host,notify) "
-          "VALUES(?,?,'queued',?,?,?,?)")
+INSERT = ("INSERT INTO jobs(name,cmd,status,created,tty,host,notify,ngpu) "
+          "VALUES(?,?,'queued',?,?,?,?,?)")
 
 
 def _where(a):
@@ -352,27 +393,47 @@ def _where(a):
     return tty, socket.gethostname(), getattr(a, "notify", None) or os.environ.get("GSCHED_NOTIFY")
 
 
+def _ngpu(c, n):
+    """Clamp a requested GPU count, warning if this daemon can never satisfy it."""
+    n = max(1, int(n or 1))
+    d = c.execute("SELECT gpus FROM daemon WHERE id=1").fetchone()
+    if d and n > len(gpulist(d["gpus"])):
+        print(f"warning: --ngpu {n} but the daemon only manages GPUs {d['gpus']} - the job "
+              f"stays queued (and is skipped over) until you widen it: gsched gpus ...")
+    return n
+
+
+def _parse_line(line, name, ngpu):
+    """A submitf line: 'cmd', 'name<TAB>cmd', or 'name<TAB>ngpu<TAB>cmd'."""
+    parts = line.split("\t")
+    if len(parts) >= 3 and parts[1].strip().isdigit():
+        return parts[0].strip() or name, int(parts[1]), "\t".join(parts[2:]).strip()
+    if len(parts) >= 2:
+        return parts[0].strip() or name, ngpu, "\t".join(parts[1:]).strip()
+    return name, ngpu, line
+
+
 def cmd_submit(a):
     c = db()
     tty, host, hook = _where(a)
-    cur = c.execute(INSERT, (a.name, a.cmd, time.time(), tty, host, hook))
+    n = _ngpu(c, getattr(a, "ngpu", 1))
+    cur = c.execute(INSERT, (a.name, a.cmd, time.time(), tty, host, hook, n))
     c.commit()
-    print(f"queued job {cur.lastrowid}" + (f" (will notify {tty})" if tty else ""))
+    print(f"queued job {cur.lastrowid}" + (f" ({n} GPUs)" if n > 1 else "")
+          + (f" (will notify {tty})" if tty else ""))
 
 
 def cmd_submitf(a):
     c = db()
     tty, host, hook = _where(a)
+    ngpu = _ngpu(c, getattr(a, "ngpu", 1))
     n = 0
     for line in open(a.file):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        name = a.name
-        # allow "name<TAB>command" lines for readable batches
-        if "\t" in line:
-            name, line = line.split("\t", 1)
-        c.execute(INSERT, (name, line.strip(), time.time(), tty, host, hook))
+        name, jn, cmd = _parse_line(line, a.name, ngpu)
+        c.execute(INSERT, (name, cmd, time.time(), tty, host, hook, max(1, jn)))
         n += 1
     c.commit()
     print(f"queued {n} jobs from {a.file}" + (f" (will notify {tty})" if tty else ""))
@@ -424,27 +485,32 @@ def cmd_status(a):
     con = Console()
 
     d = c.execute("SELECT * FROM daemon WHERE id=1").fetchone()
-    allowed = [int(g) for g in d["gpus"].split(",")] if d else []
+    allowed = gpulist(d["gpus"]) if d else []
     if d:
         age = time.time() - d["heartbeat"]
         state = "[bold green]● alive[/]" if age < d["poll"] * 3 else f"[bold red]● stale {int(age)}s[/]"
         con.print(f"{state}  daemon pid [cyan]{d['pid']}[/]  gpus [cyan]{d['gpus']}[/]  "
                   f"poll {d['poll']:g}s  mem_free<{d['mem']}MiB"
+                  + ("  [cyan]backfill[/]" if d["backfill"] else "")
                   + (f"  notify [cyan]{d['notify']}[/]" if d["notify"] else ""))
     else:
         con.print("[bold red]no daemon registered[/] - start:  python gsched.py daemon --gpus 0,1,2,3")
 
     # GPU panel
     mem = gpu_mem()
-    onpu = {r["gpu"]: r for r in c.execute("SELECT * FROM jobs WHERE status='running'")}
+    onpu = {}
+    for r in c.execute("SELECT * FROM jobs WHERE status='running'"):
+        for g in gpulist(r["gpus"]):
+            onpu[g] = r
     gt = Table(box=box.SIMPLE_HEAVY, title="GPUs", title_style="bold", expand=False)
     gt.add_column("gpu", justify="right")
     gt.add_column("mem MiB", justify="right")
     gt.add_column("job")
     for g in sorted(set(list(mem.keys())) | set(allowed)):
         j = onpu.get(g)
+        share = f" [dim]({j['ngpu']} GPUs)[/]" if j and (j["ngpu"] or 1) > 1 else ""
         tag = "[dim]not managed[/]" if g not in allowed else (
-            f"[green]#{j['id']} {j['name'] or ''}[/]" if j else "[yellow]idle[/]")
+            f"[green]#{j['id']} {j['name'] or ''}[/]{share}" if j else "[yellow]idle[/]")
         m = mem.get(g, 0)
         mc = "green" if m < (d["mem"] if d else MEM_FREE_MB) else "red"
         gt.add_row(str(g), f"[{mc}]{m}[/]", tag)
@@ -459,18 +525,22 @@ def cmd_status(a):
         if rows:
             con.print(t)
 
-    run = c.execute("SELECT * FROM jobs WHERE status='running' ORDER BY gpu").fetchall()
-    jtable("running", [(r["id"], r["name"] or "", r["gpu"], r["pid"],
+    run = sorted(c.execute("SELECT * FROM jobs WHERE status='running'").fetchall(),
+                 key=lambda r: (gpulist(r["gpus"]) or [99])[0])
+    jtable("running", [(r["id"], r["name"] or "", r["gpus"] or "-", r["pid"],
                         _dur(r["started"], None), (r["cmd"][:60] + "…") if len(r["cmd"]) > 60 else r["cmd"])
                        for r in run],
-           [("id", "right"), ("name", "left"), ("gpu", "right"), ("pid", "right"),
+           [("id", "right"), ("name", "left"), ("gpus", "left"), ("pid", "right"),
             ("elapsed", "right"), ("cmd", "left")], "green")
 
     q = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id").fetchall()
     jtable("queued", [(i + 1, r["id"], r["name"] or "",
+                       # a job asking for more than the daemon has never gets its turn
+                       f"[red]{r['ngpu']}![/]" if (r["ngpu"] or 1) > len(allowed) else r["ngpu"],
                        (r["cmd"][:70] + "…") if len(r["cmd"]) > 70 else r["cmd"])
                       for i, r in enumerate(q)],
-           [("#", "right"), ("id", "right"), ("name", "left"), ("cmd", "left")], "yellow")
+           [("#", "right"), ("id", "right"), ("name", "left"), ("ngpu", "right"),
+            ("cmd", "left")], "yellow")
 
     fin = c.execute("SELECT * FROM jobs WHERE status IN ('done','failed','evicted') "
                     "ORDER BY finished DESC LIMIT ?", (a.recent,)).fetchall()
@@ -484,7 +554,9 @@ def cmd_status(a):
 
     n = {s: c.execute("SELECT count(*) FROM jobs WHERE status=?", (s,)).fetchone()[0]
          for s in ("queued", "running", "done", "failed", "evicted")}
-    con.print(f"[dim]queued {n['queued']}  running {n['running']}  done {n['done']}  "
+    used = sum(len(gpulist(r["gpus"])) for r in run)
+    con.print(f"[dim]queued {n['queued']}  running {n['running']} "
+              f"({used}/{len(allowed)} GPUs)  done {n['done']}  "
               f"failed {n['failed']}  evicted {n['evicted']}[/]")
 
 
@@ -497,9 +569,15 @@ def main():
     d.add_argument("--poll", type=float, default=POLL_S)
     d.add_argument("--mem", type=int, default=MEM_FREE_MB, help="free-GPU memory threshold MiB")
     d.add_argument("--notify", default=None, help="machine-wide hook run when any job ends")
+    d.add_argument("--backfill", action="store_true",
+                   help="let smaller jobs run past a multi-GPU job that doesn't fit yet")
+    d.add_argument("--no-backfill", action="store_true",
+                   help="turn a remembered --backfill back off")
     d.set_defaults(fn=cmd_daemon)
 
-    def _notify_flags(p_):
+    def _job_flags(p_):
+        p_.add_argument("--ngpu", type=int, default=1,
+                        help="GPUs this job needs (default 1); it gets them all at once")
         p_.add_argument("--notify", default=None,
                         help="shell hook to run when this job ends (default $GSCHED_NOTIFY)")
         p_.add_argument("--no-tty", action="store_true",
@@ -508,13 +586,14 @@ def main():
     s = sub.add_parser("submit", help="queue one command")
     s.add_argument("cmd")
     s.add_argument("--name", default=None)
-    _notify_flags(s)
+    _job_flags(s)
     s.set_defaults(fn=cmd_submit)
 
-    sf = sub.add_parser("submitf", help="queue every line of a file (optional name<TAB>cmd)")
+    sf = sub.add_parser("submitf",
+                        help="queue every line of a file (name<TAB>cmd or name<TAB>ngpu<TAB>cmd)")
     sf.add_argument("file")
     sf.add_argument("--name", default=None)
-    _notify_flags(sf)
+    _job_flags(sf)
     sf.set_defaults(fn=cmd_submitf)
 
     g = sub.add_parser("gpus", help="change the allowed GPU list live")
